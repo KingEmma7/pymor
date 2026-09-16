@@ -9,6 +9,7 @@ import numpy as np
 from pymor.models.transfer_function import TransferFunction
 from pymor.tools.random import new_rng
 
+
 def _nodes(nodes, name):
     nodes = np.asarray(nodes)
     if nodes.ndim != 1:
@@ -18,26 +19,29 @@ def _nodes(nodes, name):
     return nodes
 
 
-def sample_transfer_function(sampling_values, samples_or_fom):
-    """Sample a transfer function on a Cartesian grid when needed.
+def _sample_transfer_function(sampling_values, fom, *, derivative=False):
+    """Sample a transfer function or its derivative on a Cartesian grid.
 
     Parameters
     ----------
     sampling_values
         A one-dimensional |NumPy array| or a sequence of such arrays. The first array contains
         Laplace-variable values; subsequent arrays contain parameter values.
-    samples_or_fom
-        Sample data, a |TransferFunction|, or a model with a `transfer_function` attribute.
+    fom
+        A |TransferFunction| or a model with a `transfer_function` attribute.
+    derivative
+        If `True`, sample the derivative with respect to the complex frequency argument.
 
     Returns
     -------
     samples
-        Sample data. For transfer-function input, the shape is
-        ``tuple(map(len, sampling_values)) + (dim_output, dim_input)``.
+        Sample data of shape ``tuple(map(len, sampling_values)) + (dim_output, dim_input)``.
+        A single frequency array produces shape `(n, dim_output, dim_input)`. Model metadata
+        such as sampling time, feedthrough and parameter names are not included.
     """
-    fom = samples_or_fom.transfer_function if hasattr(samples_or_fom, 'transfer_function') else samples_or_fom
+    fom = fom.transfer_function if hasattr(fom, 'transfer_function') else fom
     if not isinstance(fom, TransferFunction):
-        return np.asarray(samples_or_fom)
+        raise TypeError('fom must be a TransferFunction or a model with a transfer_function.')
 
     if isinstance(sampling_values, np.ndarray):
         sampling_values = (sampling_values,)
@@ -49,8 +53,9 @@ def sample_transfer_function(sampling_values, samples_or_fom):
         raise ValueError('sampling_values must contain non-empty one-dimensional arrays.')
 
     sample_shape = tuple(map(len, sampling_values))
+    evaluate = fom.eval_dtf if derivative else fom.eval_tf
     samples = [
-        fom.eval_tf(values[0], mu=fom.parameters.parse(values[1:]))
+        evaluate(values[0], mu=fom.parameters.parse(values[1:]))
         for values in product(*sampling_values)
     ]
     return np.array(samples).reshape(sample_shape + (fom.dim_output, fom.dim_input))
@@ -71,16 +76,16 @@ def complete_conjugate_pairs(nodes, samples, *data):
     return nodes, *data
 
 
-def partition_frequencies(nodes, samples, partitioning='even-odd', ordering='regular', conjugate=True):
+def partition_frequencies(nodes, samples, partitioning='even-odd', ordering='regular', enforce_real=True):
     """Partition frequency samples into left and right Loewner data sets.
 
-    Complex-conjugate nodes are assigned to the same set when `conjugate` is `True`. In that
+    Complex-conjugate nodes are assigned to the same set when `enforce_real` is `True`. In that
     case, `nodes` must already contain the corresponding conjugate samples.
     """
     if not isinstance(partitioning, str):
         return tuple(np.asarray(indices) for indices in partitioning)
 
-    if conjugate:
+    if enforce_real:
         positive_imaginary = np.flatnonzero(nodes.imag > 0)
         real = np.flatnonzero(nodes.imag == 0)
         if ordering == 'magnitude':
@@ -323,10 +328,10 @@ def _real_transformation(nodes):
         matches = np.flatnonzero(np.isclose(nodes, np.conj(node), rtol=tolerance, atol=tolerance))
         matches = matches[matches != i]
         if len(matches) != 1:
-            raise ValueError('Nodes must contain unique complex conjugate pairs when real=True.')
+            raise ValueError('Nodes must contain unique complex conjugate pairs when enforce_real=True.')
         j = matches[0]
         if visited[j]:
-            raise ValueError('Nodes must contain unique complex conjugate pairs when real=True.')
+            raise ValueError('Nodes must contain unique complex conjugate pairs when enforce_real=True.')
         scale = 1 / np.sqrt(2)
         transformation[i, i] = scale
         transformation[i, j] = scale
@@ -346,7 +351,7 @@ def _real_array(array, name):
 
 
 def loewner_quadruple(left_nodes, right_nodes, left_values, right_values, *,
-                       left_directions=None, right_directions=None, derivatives=None, real=False):
+                       left_directions=None, right_directions=None, derivatives=None, enforce_real=False):
     """Construct a Loewner quadruple from already partitioned sample data.
 
     Parameters
@@ -367,7 +372,7 @@ def loewner_quadruple(left_nodes, right_nodes, left_values, right_values, *,
     derivatives
         Optional unprojected derivatives at `left_nodes`, with the same shape as `left_values`.
         Derivatives are required for coincident left and right nodes.
-    real
+    enforce_real
         If `True`, transform conjugate-closed data to real matrices using unitary pair transforms.
         Values, derivatives and directions at conjugate nodes must be conjugates.
 
@@ -431,7 +436,7 @@ def loewner_quadruple(left_nodes, right_nodes, left_values, right_values, *,
 
     L, Ls = loewner_matrices(left_nodes, right_nodes, left_terms, right_terms, derivative_terms)
 
-    if real:
+    if enforce_real:
         TL = _real_transformation(left_nodes)
         TR = _real_transformation(right_nodes)
         if full_mimo:
