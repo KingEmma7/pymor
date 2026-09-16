@@ -7,14 +7,12 @@ import scipy.linalg as spla
 
 from pymor.algorithms.loewner import (
     _real_transformation,
+    _sample_transfer_function,
     complete_conjugate_pairs,
     loewner_quadruple,
-    sample_transfer_function,
 )
-from pymor.algorithms.to_matrix import to_matrix
 from pymor.core.cache import CacheableObject, cached
 from pymor.models.iosys import LTIModel
-from pymor.models.transfer_function import TransferFunction
 
 
 class QuadBTReductor(CacheableObject):
@@ -26,8 +24,9 @@ class QuadBTReductor(CacheableObject):
 
     The left and right quadratures approximate the observability and reachability
     Gramians, respectively. Supply explicit weights or omit them to use trapezoidal
-    quadrature on each node set independently. Use :meth:`from_model` to sample a model
-    or transfer function. No automatic partitioning is performed.
+    quadrature on each node set independently. Use :meth:`sample_transfer_function` to
+    generate data from a model or transfer function beforehand. No automatic sampling,
+    metadata inference or partitioning is performed.
 
     Parameters
     ----------
@@ -53,24 +52,22 @@ class QuadBTReductor(CacheableObject):
     derivatives
         Optional transfer function derivatives with respect to the complex argument at
         `left_nodes`, with the same shape as `left_values`. Required at coincident
-        left and right nodes; entries at other nodes are ignored.
+        left and right nodes after conjugate completion; entries at other nodes are ignored.
+        Use :meth:`sample_transfer_function` with `derivative=True` to generate these data.
     sampling_time
         Zero for continuous-time systems, otherwise the positive sampling time in seconds.
         Discrete-time nodes are :math:`z=e^{i\theta}`, with `theta` in radians per sample.
     feedthrough
         Known feedthrough matrix of shape `(dim_output, dim_input)`, or a scalar for SISO
         data. Subtracted from the samples and restored in the ROM. `None` means zero.
-    real
-        If `True`, use unitary conjugate-pair transformations to obtain a real ROM.
-        Each completed node set must be conjugate-closed, with conjugate sample data and
-        equal weights within every pair. The feedthrough must be real. Roundoff-sized
-        discrepancies in conjugate nodes and discrete-time endpoints are canonicalised.
-    conjugate
-        If `True`, append missing conjugate nodes and conjugated samples, derivatives and
-        supplied weights. This assumes a real underlying system. Supplied weights are
-        per-node weights for the full contour; they are copied, not halved. Conjugate nodes
-        and discrete-time endpoints are canonicalised as for `real=True`.
-        Defaults to `False`; without completion, supply the full contour yourself.
+    enforce_real
+        If `True`, assume a real underlying system, append missing conjugate nodes and
+        conjugated samples, derivatives and supplied weights, and use unitary pair
+        transformations to obtain a real ROM. Supplied weights are per-node weights for
+        the full contour; they are copied, not halved, and must agree within every pair.
+        The feedthrough must be real. Roundoff-sized discrepancies in conjugate nodes and
+        discrete-time endpoints are canonicalised. If `False`, neither conjugate completion
+        nor realification is performed.
 
     Notes
     -----
@@ -85,16 +82,18 @@ class QuadBTReductor(CacheableObject):
 
     cache_region = 'memory'
 
+    sample_transfer_function = staticmethod(_sample_transfer_function)
+
     def __init__(self, left_nodes, right_nodes, left_values, right_values, left_weights=None, right_weights=None,
-                 *, derivatives=None, sampling_time=0, feedthrough=None, real=True, conjugate=False):
+                 *, derivatives=None, sampling_time=0, feedthrough=None, enforce_real=True):
         sampling_time = float(sampling_time)
         if not np.isfinite(sampling_time) or sampling_time < 0:
             raise ValueError('sampling_time must be finite and nonnegative.')
         left_nodes, left_values, left_weights, derivatives = self._prepare_data(
-            left_nodes, left_values, left_weights, derivatives, 'left', sampling_time, conjugate, real,
+            left_nodes, left_values, left_weights, derivatives, 'left', sampling_time, enforce_real,
         )
         right_nodes, right_values, right_weights, _ = self._prepare_data(
-            right_nodes, right_values, right_weights, None, 'right', sampling_time, conjugate, real,
+            right_nodes, right_values, right_weights, None, 'right', sampling_time, enforce_real,
         )
         if left_values.shape[1:] != right_values.shape[1:]:
             raise ValueError('Left and right samples must have matching input and output dimensions.')
@@ -105,72 +104,11 @@ class QuadBTReductor(CacheableObject):
                 feedthrough = feedthrough.reshape(1, 1)
             if feedthrough.shape != (self.dim_output, self.dim_input) or not np.all(np.isfinite(feedthrough)):
                 raise ValueError('feedthrough must be a finite matrix of shape (dim_output, dim_input).')
-            if real:
+            if enforce_real:
                 if np.any(feedthrough.imag != 0):
-                    raise ValueError('feedthrough must be real when real=True.')
+                    raise ValueError('feedthrough must be real when enforce_real=True.')
                 feedthrough = feedthrough.real
         self.__auto_init(locals())
-
-    @classmethod
-    def from_model(cls, fom, left_nodes, right_nodes, *, left_weights=None, right_weights=None,
-                   derivatives=None, feedthrough=None, real=True, conjugate=True):
-        """Sample a model or transfer function and construct a QuadBT reductor.
-
-        Parameters
-        ----------
-        fom
-            Nonparametric |TransferFunction| or model with a `transfer_function` attribute.
-            The sampling time is taken from this transfer function. For an |LTIModel|,
-            the feedthrough is inferred from its `D` operator unless explicitly supplied.
-            For other inputs, unknown feedthrough is assumed to be zero; supply it explicitly
-            when the transfer function is not strictly proper.
-        left_nodes, right_nodes
-            Complex sampling nodes, as in the constructor, not angular frequencies.
-        left_weights, right_weights
-            Optional explicit quadrature weights, as in the constructor. If omitted,
-            trapezoidal rules appropriate to the model's sampling time are used.
-        derivatives
-            Optional derivatives at the supplied left nodes. If omitted, evaluate the
-            transfer function derivative only at nodes that overlap the right grid after
-            conjugate completion. Overlapping grids require derivative access or explicit data.
-        feedthrough
-            Optional known feedthrough, as in the constructor.
-        real
-            Whether to construct a real ROM, as in the constructor.
-        conjugate
-            Whether to complete conjugate data. Defaults to `True`, assuming a real system.
-            Set both `conjugate=False` and `real=False` for complex systems.
-
-        Returns
-        -------
-        reductor
-            The sampled :class:`QuadBTReductor`.
-        """
-        tf = fom.transfer_function if hasattr(fom, 'transfer_function') else fom
-        if not isinstance(tf, TransferFunction):
-            raise TypeError('fom must be a TransferFunction or a model with a transfer_function.')
-        if tf.parametric:
-            raise ValueError('from_model requires a nonparametric transfer function.')
-        sampling_time = tf.sampling_time
-        left_nodes = cls._nodes(left_nodes, 'left', sampling_time, conjugate or real)
-        right_nodes = cls._nodes(right_nodes, 'right', sampling_time, conjugate or real)
-        left_values = sample_transfer_function(left_nodes, tf)
-        right_values = sample_transfer_function(right_nodes, tf)
-        if derivatives is None:
-            overlap = np.isin(left_nodes, right_nodes)
-            if conjugate:
-                overlap |= np.isin(left_nodes.conj(), right_nodes)
-            if np.any(overlap):
-                if tf.dtf is None:
-                    raise ValueError('Overlapping quadrature nodes require transfer function derivatives.')
-                derivatives = np.zeros(left_values.shape, dtype=complex)
-                for i in np.flatnonzero(overlap):
-                    derivatives[i] = tf.eval_dtf(left_nodes[i])
-        if feedthrough is None and isinstance(fom, LTIModel):
-            feedthrough = to_matrix(fom.D, format='dense')
-        return cls(left_nodes, right_nodes, left_values, right_values, left_weights, right_weights,
-                   derivatives=derivatives, sampling_time=sampling_time, feedthrough=feedthrough,
-                   real=real, conjugate=conjugate)
 
     @staticmethod
     def _nodes(nodes, name, sampling_time, canonicalize):
@@ -190,8 +128,8 @@ class QuadBTReductor(CacheableObject):
         return nodes
 
     @classmethod
-    def _prepare_data(cls, nodes, values, weights, derivatives, name, sampling_time, conjugate, real):
-        nodes = cls._nodes(nodes, name, sampling_time, conjugate or real)
+    def _prepare_data(cls, nodes, values, weights, derivatives, name, sampling_time, enforce_real):
+        nodes = cls._nodes(nodes, name, sampling_time, enforce_real)
         values = cls._samples(values, len(nodes), f'{name}_values')
         if derivatives is not None:
             derivatives = cls._samples(derivatives, len(nodes), 'derivatives')
@@ -200,13 +138,13 @@ class QuadBTReductor(CacheableObject):
         automatic_weights = weights is None
         weights = np.ones(len(nodes)) if automatic_weights else weights
         nodes, weights = cls._quadrature_rule(nodes, weights, name, False)
-        if conjugate:
+        if enforce_real:
             extra = () if derivatives is None else (derivatives,)
             nodes, values, weights, *extra = complete_conjugate_pairs(nodes, values, weights, *extra)
             derivatives = extra[0] if extra else None
         if automatic_weights:
             weights = cls._trapezoidal_weights(nodes, sampling_time)
-        nodes, weights = cls._quadrature_rule(nodes, weights, name, real)
+        nodes, weights = cls._quadrature_rule(nodes, weights, name, enforce_real)
         return nodes, values, weights, derivatives
 
     @staticmethod
@@ -231,18 +169,18 @@ class QuadBTReductor(CacheableObject):
         return weights
 
     @staticmethod
-    def _quadrature_rule(nodes, weights, name, real):
+    def _quadrature_rule(nodes, weights, name, enforce_real):
         weights = np.array(weights, copy=True)
         if weights.shape != nodes.shape or not np.isrealobj(weights) \
                 or not np.all(np.isfinite(weights)) or np.any(weights < 0):
             raise ValueError(f'{name}_weights must be finite, real, nonnegative and aligned with nodes.')
         weights = weights.astype(float)
-        if real:
+        if enforce_real:
             transformation = _real_transformation(nodes)
             # Weighting commutes with realification only for equal conjugate-pair weights.
             if not np.allclose(transformation * weights, weights[:, np.newaxis] * transformation,
                                rtol=1e-12, atol=0):
-                raise ValueError(f'{name}_weights must be equal at conjugate nodes when real=True.')
+                raise ValueError(f'{name}_weights must be equal at conjugate nodes when enforce_real=True.')
         return nodes, weights
 
     @staticmethod
@@ -261,13 +199,13 @@ class QuadBTReductor(CacheableObject):
 
         For weighted resolvent factors :math:`O` and :math:`R`, these matrices equal
         :math:`OER`, :math:`OAR`, :math:`OB` and :math:`CR`, respectively. They are
-        constructed without accessing the underlying system matrices. When `real=True`,
+        constructed without accessing the underlying system matrices. When `enforce_real=True`,
         unitary transformations give their real counterparts.
         """
         D = 0 if self.feedthrough is None else self.feedthrough
         L, Ls, V, W = loewner_quadruple(
             self.left_nodes, self.right_nodes, self.left_values - D, self.right_values - D,
-            derivatives=self.derivatives, real=self.real,
+            derivatives=self.derivatives, enforce_real=self.enforce_real,
         )
         wl = np.repeat(np.sqrt(self.left_weights), self.dim_output)[:, np.newaxis]
         wr = np.repeat(np.sqrt(self.right_weights), self.dim_input)[np.newaxis, :]
